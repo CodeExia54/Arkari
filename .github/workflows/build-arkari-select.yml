@@ -1,0 +1,229 @@
+# Build Arkari (goron-based LLVM obfuscator) clang for a SELECTED branch and test it against a
+# SELECTED Android NDK on arm64 (aarch64-linux-android). Chosen from the Actions tab before running.
+#
+# Arkari is a FULL LLVM monorepo (no submodule/patch). Obfuscation is built into clang; enable at
+# compile time with -mllvm flags.
+#
+# Recommended matched pairs (same LLVM major -> clean resource-dir/runtime lib match):
+#   llvm-18.x <-> NDK r27c   (LLVM 18)
+#   llvm-19.x <-> NDK r28c   (LLVM 19)
+#   llvm-20.x <-> NDK r29    (LLVM 20)   <-- default (latest matched pair)
+name: build-arkari-select
+
+on:
+  workflow_dispatch:
+    inputs:
+      obf_branch:
+        description: "Arkari branch (LLVM version) to build"
+        type: choice
+        default: llvm-20.x
+        options:
+          - llvm-20.x
+          - llvm-19.x
+          - llvm-18.x
+          - llvm-17.x
+          - llvm-16.x
+          - llvm-15.x
+          - llvm-14.x
+      ndk_version:
+        description: "Android NDK version"
+        type: choice
+        default: r29
+        options:
+          - r29
+          - r28c
+          - r27c
+          - r26d
+          - r25c
+      api_level:
+        description: "Android API level"
+        type: string
+        default: "24"
+      obf_flags:
+        description: "Arkari obfuscation flags (-mllvm ...)."
+        type: string
+        default: "-mllvm -irobf -mllvm -irobf-cse -mllvm -irobf-fla -mllvm -irobf-indbr -mllvm -irobf-icall -mllvm -irobf-indgv"
+      runner:
+        description: "Runner (ubuntu-latest recommended; Termux/phone cannot build LLVM)"
+        type: choice
+        default: ubuntu-latest
+        options:
+          - ubuntu-latest
+          - ubuntu-22.04
+          - self-hosted
+
+env:
+  SECRET: "SUPER_SECRET_TOKEN_9F3A21D7E5B0"
+
+jobs:
+  build-and-test:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 350
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Install host build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build ccache lld clang python3 git unzip curl binutils qemu-user-static
+          qemu-aarch64-static --version | head -1
+
+      - name: Checkout selected Arkari branch (shallow)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.obf_branch }}
+          submodules: false
+          fetch-depth: 1
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-arkari-${{ inputs.obf_branch }}-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-arkari-${{ inputs.obf_branch }}-${{ runner.os }}-
+
+      - name: Configure clang build
+        run: |
+          set -euxo pipefail
+          cmake -G Ninja -S llvm -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_TARGETS_TO_BUILD="AArch64" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_OPTIMIZED_TABLEGEN=ON \
+            -DLLVM_USE_LINKER=lld \
+            -DLLVM_CCACHE_BUILD=ON \
+            -DBUILD_SHARED_LIBS=ON \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DCLANG_ENABLE_ARCMT=OFF \
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF
+
+      - name: Build clang (with Arkari obfuscation)
+        run: |
+          set -euxo pipefail
+          ninja -C build clang
+          ./build/bin/clang --version
+          ccache -s || true
+
+      - name: Download Android NDK ${{ inputs.ndk_version }}
+        run: |
+          set -euxo pipefail
+          NDK="${{ inputs.ndk_version }}"
+          curl -fsSL -o ndk.zip "https://dl.google.com/android/repository/android-ndk-${NDK}-linux.zip"
+          unzip -q ndk.zip
+          echo "ANDROID_NDK=$PWD/android-ndk-${NDK}" >> "$GITHUB_ENV"
+
+      - name: Version compatibility check (Arkari LLVM vs NDK clang)
+        run: |
+          set -euxo pipefail
+          NDK_BIN="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          OBF_MAJOR="$(./build/bin/clang --version | grep -oE 'version [0-9]+' | head -1 | grep -oE '[0-9]+')"
+          NDK_MAJOR="$("$NDK_BIN/clang" --version | grep -oE 'version [0-9]+' | head -1 | grep -oE '[0-9]+')"
+          echo "Arkari clang major: $OBF_MAJOR | NDK clang major: $NDK_MAJOR"
+          echo "OBF_MAJOR=$OBF_MAJOR" >> "$GITHUB_ENV"
+          echo "NDK_MAJOR=$NDK_MAJOR" >> "$GITHUB_ENV"
+          if [ "$OBF_MAJOR" != "$NDK_MAJOR" ]; then
+            echo "::warning::LLVM major mismatch (Arkari $OBF_MAJOR vs NDK $NDK_MAJOR). Builds via -resource-dir, but a matching pair is recommended."
+          fi
+
+      - name: Build arm64 samples (obfuscated vs baseline) and verify
+        run: |
+          set -euxo pipefail
+
+          CLANG="$PWD/build/bin/clang"
+          NDK_BIN="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          SYSROOT="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          RESDIR="$(ls -d $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/* | sort -V | tail -1)"
+          API="${{ inputs.api_level }}"
+          OBF_FLAGS="${{ inputs.obf_flags }}"
+          echo "Using NDK resource dir: $RESDIR ; target aarch64-linux-android$API"
+
+          COMMON=(--target=aarch64-linux-android${API}
+                  --sysroot="$SYSROOT"
+                  -resource-dir="$RESDIR"
+                  -B"$NDK_BIN"
+                  -fuse-ld=lld
+                  -O2 -static)
+
+          mkdir -p out
+          cat > out/app.c <<EOF
+          #include <stdio.h>
+          __attribute__((noinline)) int compute(int n){
+            int s = 0;
+            for (int i = 0; i < n; i++) s += (i % 3) ? i : -i;
+            return s;
+          }
+          int main(int argc, char **argv){
+            const char *secret = "${SECRET}";
+            int n = 1000 + argc;
+            printf("%s\n", secret);
+            printf("R=%d\n", compute(n));
+            return 0;
+          }
+          EOF
+
+          echo "::group::Compile baseline"
+          "$CLANG" "${COMMON[@]}" out/app.c -o out/app_plain
+          echo "::endgroup::"
+          echo "::group::Compile obfuscated ($OBF_FLAGS)"
+          "$CLANG" "${COMMON[@]}" $OBF_FLAGS out/app.c -o out/app_obf
+          echo "::endgroup::"
+          file out/app_plain out/app_obf
+
+          PASS=1
+
+          echo "== Check 1: runtime correctness (qemu-aarch64) =="
+          OUT_PLAIN="$(qemu-aarch64-static ./out/app_plain)"
+          OUT_OBF="$(qemu-aarch64-static ./out/app_obf)"
+          echo "baseline : $OUT_PLAIN"
+          echo "obf      : $OUT_OBF"
+          [ "$OUT_PLAIN" = "$OUT_OBF" ] && echo "OK: outputs match." || { echo "FAIL: output changed."; PASS=0; }
+
+          echo "== Check 2: string encryption (irobf-cse) =="
+          strings out/app_plain | grep -q "$SECRET" \
+            && echo "OK: secret present in baseline." \
+            || { echo "INCONCLUSIVE: secret missing from baseline."; PASS=0; }
+          if strings out/app_obf | grep -q "$SECRET"; then
+            echo "FAIL: secret STILL in obfuscated binary -> string enc did not run."; PASS=0
+          else
+            echo "OK: secret ABSENT from obfuscated binary -> string encryption worked."
+          fi
+
+          echo "== Check 3: obfuscation grew .text =="
+          T_PLAIN=$("$NDK_BIN/llvm-size" out/app_plain | awk 'NR==2{print $1}')
+          T_OBF=$("$NDK_BIN/llvm-size"  out/app_obf   | awk 'NR==2{print $1}')
+          echo "baseline .text=$T_PLAIN  obf .text=$T_OBF"
+          [ "$T_OBF" -gt "$T_PLAIN" ] && echo "OK: obf code larger." || { echo "FAIL: no code growth."; PASS=0; }
+
+          {
+            echo "### Arkari ${{ inputs.obf_branch }} (LLVM $OBF_MAJOR) × NDK ${{ inputs.ndk_version }} (clang $NDK_MAJOR) — arm64"
+            [ "$OBF_MAJOR" = "$NDK_MAJOR" ] && echo "_Matched pair ✅_" || echo "_⚠️ LLVM major mismatch — experimental_"
+            echo ""
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| Runtime output matches baseline | $([ "$OUT_PLAIN" = "$OUT_OBF" ] && echo '✅' || echo '❌') |"
+            echo "| Secret in baseline | $(strings out/app_plain | grep -q "$SECRET" && echo 'present ✅' || echo 'missing ❌') |"
+            echo "| Secret removed from obfuscated | $(strings out/app_obf | grep -q "$SECRET" && echo 'STILL PRESENT ❌' || echo 'encrypted ✅') |"
+            echo "| .text grew | \`$T_PLAIN\` → \`$T_OBF\` $([ "$T_OBF" -gt "$T_PLAIN" ] && echo '✅' || echo '❌') |"
+            echo ""
+            echo "Flags: \`$OBF_FLAGS\` @ -O2, target \`aarch64-linux-android${API}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          [ "$PASS" -eq 1 ] || { echo "One or more checks FAILED."; exit 1; }
+          echo "All checks passed."
+
+      - name: Upload sample binaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arkari-arm64-${{ inputs.obf_branch }}-${{ inputs.ndk_version }}
+          path: out/app_*
+          if-no-files-found: ignore
