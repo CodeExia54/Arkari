@@ -2,12 +2,14 @@
 # SELECTED Android NDK on arm64 (aarch64-linux-android). Chosen from the Actions tab before running.
 #
 # Arkari is a FULL LLVM monorepo (no submodule/patch). Obfuscation is built into clang; enable at
-# compile time with -mllvm flags.
+# compile time with -mllvm flags. Static (Release) build, same as the repo's release workflows.
 #
-# Recommended matched pairs (same LLVM major -> clean resource-dir/runtime lib match):
-#   llvm-18.x <-> NDK r27c   (LLVM 18)
-#   llvm-19.x <-> NDK r28c   (LLVM 19)
-#   llvm-20.x <-> NDK r29    (LLVM 20)   <-- default (latest matched pair)
+# The obfuscating clang toolchain is ALWAYS uploaded as an artifact (even if the sample test fails).
+#
+# Recommended matched pairs (clang major must match the NDK's resource dir lib/clang/<major>):
+#   llvm-18.x <-> NDK r27c   (clang 18)
+#   llvm-19.x <-> NDK r28c   (clang 19)
+#   llvm-21.x <-> NDK r29    (clang 21)   <-- default (latest matched pair; r29 resource dir = clang/21)
 name: build-arkari-select
 
 on:
@@ -16,8 +18,9 @@ on:
       obf_branch:
         description: "Arkari branch (LLVM version) to build"
         type: choice
-        default: llvm-20.x
+        default: llvm-21.x
         options:
+          - llvm-21.x
           - llvm-20.x
           - llvm-19.x
           - llvm-18.x
@@ -40,9 +43,9 @@ on:
         type: string
         default: "24"
       obf_flags:
-        description: "Arkari obfuscation flags (-mllvm ...)."
+        description: "Arkari obfuscation flags (-mllvm ...). Flatten flag is -irobf-cff."
         type: string
-        default: "-mllvm -irobf -mllvm -irobf-cse -mllvm -irobf-fla -mllvm -irobf-indbr -mllvm -irobf-icall -mllvm -irobf-indgv"
+        default: "-mllvm -irobf -mllvm -irobf-cse -mllvm -irobf-cff -mllvm -irobf-indbr -mllvm -irobf-icall -mllvm -irobf-indgv"
       runner:
         description: "Runner (ubuntu-latest recommended; Termux/phone cannot build LLVM)"
         type: choice
@@ -113,6 +116,70 @@ jobs:
           ./build/bin/clang --version
           ccache -s || true
 
+      # ---- Package + upload the obfuscating clang BEFORE testing, so it is saved no matter what. ----
+      - name: Package obfuscating clang toolchain
+        if: always()
+        run: |
+          set -uxo pipefail
+          rm -rf dist && mkdir -p dist/bin
+          if [ ! -f build/bin/clang ]; then echo "::warning::clang was not built; nothing to package."; exit 0; fi
+          cp build/bin/clang dist/bin/clang
+          cp build/bin/clang dist/bin/clang++
+          strip dist/bin/clang dist/bin/clang++ 2>/dev/null || true
+          cat > dist/install-into-ndk.sh <<'SH'
+          #!/usr/bin/env bash
+          # Drop the Arkari obfuscating clang into an NDK whose clang major matches this build.
+          # Usage: ./install-into-ndk.sh /path/to/android-ndk-rXX
+          set -euo pipefail
+          NDK="${1:?pass the NDK path, e.g. /home/you/android-ndk-r29}"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          [ -d "$BIN" ] || { echo "Not an NDK toolchain bin dir: $BIN"; exit 1; }
+          here="$(cd "$(dirname "$0")" && pwd)"
+          for f in clang clang++; do
+            [ -e "$BIN/$f.orig" ] || cp -a "$BIN/$f" "$BIN/$f.orig"
+            install -m0755 "$here/bin/$f" "$BIN/$f"
+          done
+          echo "Installed obfuscating clang into $BIN (originals saved as clang.orig / clang++.orig)."
+          echo "Enable obfuscation by adding -mllvm flags, and build at -O1 or higher (NOT APP_OPTIM=debug)."
+          SH
+          chmod +x dist/install-into-ndk.sh
+          cat > dist/README.txt <<'TXT'
+          Arkari obfuscating clang  (HOST binary: x86_64 Linux; it RUNS on Ubuntu and EMITS arm64).
+          =================================================================================
+
+          Matching: this clang's major version must equal your NDK's clang (its lib/clang/<major> dir).
+            NDK r27c -> clang 18 ,  r28c -> clang 19 ,  r29 -> clang 21.
+
+          Install into your NDK (transparent for ndk-build / CMake / gradle):
+            ./install-into-ndk.sh /path/to/android-ndk-rXX
+          (restores: copy clang.orig back over clang.)
+
+          Then obfuscate by adding flags to your compile (e.g. ndk-build: LOCAL_CPPFLAGS += ...):
+            -mllvm -irobf                 enable the framework (required)
+            -mllvm -irobf-cse             C-string encryption
+            -mllvm -irobf-cff             control-flow flattening
+            -mllvm -irobf-indbr           indirect branches (encrypted targets)
+            -mllvm -irobf-icall           indirect calls (encrypted targets)
+            -mllvm -irobf-indgv           indirect global refs
+            -mllvm -irobf-cie             integer constant encryption
+            -mllvm -irobf-cfe             FP constant encryption
+
+          IMPORTANT:
+            * Obfuscation passes only run at -O1 or higher. At -O0 (APP_OPTIM=debug) the flags do nothing.
+            * To obfuscate only your own functions (not Boost/OpenSSL/Skia headers), pass just
+              `-mllvm -irobf` and annotate the functions:
+                  [[clang::annotate("+cff +icall +indbr +cse")]] void secret_fn() { ... }
+          TXT
+          du -h dist/bin/* || true
+
+      - name: Upload obfuscating clang toolchain
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arkari-clang-${{ inputs.obf_branch }}
+          path: dist/**
+          if-no-files-found: warn
+
       - name: Download Android NDK ${{ inputs.ndk_version }}
         run: |
           set -euxo pipefail
@@ -131,7 +198,7 @@ jobs:
           echo "OBF_MAJOR=$OBF_MAJOR" >> "$GITHUB_ENV"
           echo "NDK_MAJOR=$NDK_MAJOR" >> "$GITHUB_ENV"
           if [ "$OBF_MAJOR" != "$NDK_MAJOR" ]; then
-            echo "::warning::LLVM major mismatch (Arkari $OBF_MAJOR vs NDK $NDK_MAJOR). Builds via -resource-dir, but a matching pair is recommended."
+            echo "::warning::LLVM major mismatch (Arkari $OBF_MAJOR vs NDK $NDK_MAJOR). Builds via -resource-dir, but a matching pair is recommended (for a clean NDK drop-in, match these)."
           fi
 
       - name: Build arm64 samples (obfuscated vs baseline) and verify
@@ -181,8 +248,8 @@ jobs:
           PASS=1
 
           echo "== Check 1: runtime correctness (qemu-aarch64) =="
-          OUT_PLAIN="$(qemu-aarch64-static ./out/app_plain)"
-          OUT_OBF="$(qemu-aarch64-static ./out/app_obf)"
+          OUT_PLAIN="$(qemu-aarch64-static ./out/app_plain || echo QEMU_FAIL_PLAIN)"
+          OUT_OBF="$(qemu-aarch64-static ./out/app_obf || echo QEMU_FAIL_OBF)"
           echo "baseline : $OUT_PLAIN"
           echo "obf      : $OUT_OBF"
           [ "$OUT_PLAIN" = "$OUT_OBF" ] && echo "OK: outputs match." || { echo "FAIL: output changed."; PASS=0; }
@@ -224,6 +291,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: arkari-arm64-${{ inputs.obf_branch }}-${{ inputs.ndk_version }}
+          name: arkari-arm64-samples-${{ inputs.obf_branch }}-${{ inputs.ndk_version }}
           path: out/app_*
           if-no-files-found: ignore
