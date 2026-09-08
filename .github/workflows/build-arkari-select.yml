@@ -43,9 +43,9 @@ on:
         type: string
         default: "24"
       obf_flags:
-        description: "Arkari obfuscation flags (-mllvm ...). Flatten flag is -irobf-cff."
+        description: "Arkari obfuscation flags (-mllvm ...). Flatten flag is -irobf-fla on llvm-21.x (llvm-20.x uses -irobf-cff)."
         type: string
-        default: "-mllvm -irobf -mllvm -irobf-cse -mllvm -irobf-cff -mllvm -irobf-indbr -mllvm -irobf-icall -mllvm -irobf-indgv"
+        default: "-mllvm -irobf -mllvm -irobf-cse -mllvm -irobf-fla -mllvm -irobf-indbr -mllvm -irobf-icall -mllvm -irobf-indgv"
       runner:
         description: "Runner (ubuntu-latest recommended; Termux/phone cannot build LLVM)"
         type: choice
@@ -157,18 +157,22 @@ jobs:
           Then obfuscate by adding flags to your compile (e.g. ndk-build: LOCAL_CPPFLAGS += ...):
             -mllvm -irobf                 enable the framework (required)
             -mllvm -irobf-cse             C-string encryption
-            -mllvm -irobf-cff             control-flow flattening
+            -mllvm -irobf-fla             control-flow flattening (llvm-20.x: -irobf-cff)
             -mllvm -irobf-indbr           indirect branches (encrypted targets)
             -mllvm -irobf-icall           indirect calls (encrypted targets)
             -mllvm -irobf-indgv           indirect global refs
             -mllvm -irobf-cie             integer constant encryption
             -mllvm -irobf-cfe             FP constant encryption
 
+          NOTE on string encryption (-irobf-cse): it encrypts string LITERALS used in code and
+          LOCAL char[] arrays, but NOT global string variables (static const char* / global char[]).
+          Put sensitive strings in local scope if you need them encrypted.
+
           IMPORTANT:
             * Obfuscation passes only run at -O1 or higher. At -O0 (APP_OPTIM=debug) the flags do nothing.
             * To obfuscate only your own functions (not Boost/OpenSSL/Skia headers), pass just
               `-mllvm -irobf` and annotate the functions:
-                  [[clang::annotate("+cff +icall +indbr +cse")]] void secret_fn() { ... }
+                  [[clang::annotate("+fla +icall +indbr +cse")]] void secret_fn() { ... }
           TXT
           du -h dist/bin/* || true
 
@@ -229,7 +233,7 @@ jobs:
             return s;
           }
           int main(int argc, char **argv){
-            const char *secret = "${SECRET}";
+            char secret[] = "${SECRET}";   /* local array: -irobf-cse encrypts it (it skips GLOBAL strings) */
             int n = 1000 + argc;
             printf("%s\n", secret);
             printf("R=%d\n", compute(n));
