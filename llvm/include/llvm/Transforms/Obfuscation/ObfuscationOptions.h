@@ -80,12 +80,14 @@ protected:
   std::shared_ptr<ObfOpt> CieOpt = nullptr;
   std::shared_ptr<ObfOpt> CfeOpt = nullptr;
   std::shared_ptr<ObfOpt> RttiOpt = nullptr;
+  std::shared_ptr<ObfOpt> VmpOpt = nullptr;
 
-  SmallString<32> RandomSeed;
+  SmallString<32>  RandomSeed;
+  SmallString<256> VmpManifestPath;
 
 public:
   SmallVector<std::shared_ptr<ObfOpt>> getAllOpt() const {
-    SmallVector<std::shared_ptr<ObfOpt>, 7> allOpt;
+    SmallVector<std::shared_ptr<ObfOpt>, 8> allOpt;
     allOpt.push_back(IndBrOpt);
     allOpt.push_back(ICallOpt);
     allOpt.push_back(IndGvOpt);
@@ -94,6 +96,7 @@ public:
     allOpt.push_back(CieOpt);
     allOpt.push_back(CfeOpt);
     allOpt.push_back(RttiOpt);
+    allOpt.push_back(VmpOpt);
     return allOpt;
   }
 
@@ -104,7 +107,8 @@ public:
                      const std::shared_ptr<ObfOpt> &cseOpt,
                      const std::shared_ptr<ObfOpt> &cieOpt,
                      const std::shared_ptr<ObfOpt> &cfeOpt,
-                     const std::shared_ptr<ObfOpt> &rttiOpt) {
+                     const std::shared_ptr<ObfOpt> &rttiOpt,
+                     const std::shared_ptr<ObfOpt> &vmpOpt) {
     this->IndBrOpt = indBrOpt;
     this->ICallOpt = iCallOpt;
     this->IndGvOpt = indGvOpt;
@@ -113,6 +117,7 @@ public:
     this->CieOpt = cieOpt;
     this->CfeOpt = cfeOpt;
     this->RttiOpt = rttiOpt;
+    this->VmpOpt = vmpOpt;
   }
 
   ObfuscationOptions() : ObfuscationOptions{
@@ -123,7 +128,8 @@ public:
                            std::make_shared<ObfOpt>("cse"),
                            std::make_shared<ObfOpt>("cie"),
                            std::make_shared<ObfOpt>("cfe"),
-                           std::make_shared<ObfOpt>("rtti")
+                           std::make_shared<ObfOpt>("rtti"),
+                           std::make_shared<ObfOpt>("vmp")
                        } {}
 
   auto indBrOpt() const {
@@ -158,8 +164,16 @@ public:
     return RttiOpt;
   }
 
+  auto vmpOpt() const {
+    return VmpOpt;
+  }
+
   auto &randomSeed() {
     return RandomSeed;
+  }
+
+  auto &vmpManifestPath() {
+    return VmpManifestPath;
   }
 
   static std::shared_ptr<ObfuscationOptions> readConfigFile(

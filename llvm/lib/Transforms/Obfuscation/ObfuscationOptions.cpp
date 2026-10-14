@@ -128,6 +128,16 @@ std::shared_ptr<ObfuscationOptions> ObfuscationOptions::readConfigFile(
   return result;
 }
 
+// fla/icall/indbr hide a function's control flow at IR level. Once a
+// function is handed to a binary-level VM packer (+vmp), that hiding is
+// redundant and only adds risk of the packer's instruction decoder hitting
+// a pattern it doesn't support. So unless the user explicitly asks for one
+// of these by name on a +vmp function, default it off there.
+static bool isStructuralOpt(StringRef attributeName) {
+  return attributeName == "fla" || attributeName == "icall" ||
+      attributeName == "indbr";
+}
+
 ObfOpt ObfuscationOptions::toObfuscate(const std::shared_ptr<ObfOpt> &option,
                                        Function *                     f) {
   const auto attrEnable = "+" + option->attributeName();
@@ -144,11 +154,16 @@ ObfOpt ObfuscationOptions::toObfuscate(const std::shared_ptr<ObfOpt> &option,
 
   bool annotationEnableFound = false;
   bool annotationDisableFound = false;
+  bool hasVmpTag = false;
 
   auto annotations = readAnnotate(f);
   int  levelSet = 0;
   if (!annotations.empty()) {
     for (const auto &annotation : annotations) {
+      if (option->attributeName() != "vmp" &&
+          annotation.find("+vmp") != std::string::npos) {
+        hasVmpTag = true;
+      }
       if (annotation.find(attrDisable) != std::string::npos) {
         result.setEnable(false);
         annotationDisableFound = true;
@@ -234,7 +249,11 @@ ObfOpt ObfuscationOptions::toObfuscate(const std::shared_ptr<ObfOpt> &option,
   }
 
   if (!annotationDisableFound && !annotationEnableFound) {
-    result.setEnable(option->isEnabled());
+    if (hasVmpTag && isStructuralOpt(option->attributeName())) {
+      result.setEnable(false);
+    } else {
+      result.setEnable(option->isEnabled());
+    }
   }
   if (!levelSet) {
     result.setLevel(option->level());
