@@ -11,7 +11,8 @@ add_llvm_component_library(LLVMObfuscation
   ConstantIntEncryption.cpp
   ConstantFPEncryption.cpp
   MicrosoftRTTIEraser.cpp
-  
+  VMPTagger.cpp
+
   COMPONENT_NAME
   Obfuscation
   

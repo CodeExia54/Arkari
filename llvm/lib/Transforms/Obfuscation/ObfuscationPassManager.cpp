@@ -1,4 +1,5 @@
 #include "llvm/Transforms/Obfuscation/ObfuscationPassManager.h"
+#include "llvm/Transforms/Obfuscation/VMPTagger.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
@@ -71,6 +72,21 @@ static cl::opt<uint32_t> LevelIRConstantFPEncryption(
 static cl::opt<bool>
 EnableRttiEraser("irobf-rtti", cl::init(false), cl::NotHidden,
                  cl::desc("Enable RTTI Eraser."));
+
+
+static cl::opt<bool>
+EnableVMPTagger("irobf-vmp", cl::init(false), cl::NotHidden,
+                cl::desc(
+                    "Enable tagging of +vmp annotated functions for "
+                    "post-link VM packing."));
+
+
+static cl::opt<std::string>
+VmpManifestPath("arkari-vmp-manifest", cl::init(std::string{}),
+                cl::NotHidden,
+                cl::desc(
+                    "Path to write the list of +vmp tagged function "
+                    "symbol names to, one per line."));
 
 
 static cl::opt<std::string>
@@ -149,6 +165,8 @@ struct ObfuscationPassManager : public ModulePass {
     Opt->cfeOpt()->readOpt(EnableIRConstantFPEncryption,
                            LevelIRConstantFPEncryption);
     Opt->rttiOpt()->readOpt(EnableRttiEraser);
+    Opt->vmpOpt()->readOpt(EnableVMPTagger);
+    Opt->vmpManifestPath() = VmpManifestPath.getValue();
     return Opt;
   }
 
@@ -157,7 +175,7 @@ struct ObfuscationPassManager : public ModulePass {
     if (EnableIndirectBr || EnableIndirectCall || EnableIndirectGV ||
         EnableIRFlattening || EnableIRStringEncryption ||
         EnableIRConstantIntEncryption || EnableIRConstantFPEncryption ||
-        EnableRttiEraser || !ArkariConfigPath.empty()) {
+        EnableRttiEraser || EnableVMPTagger || !ArkariConfigPath.empty()) {
       EnableIRObfuscation = true;
     }
 
@@ -169,6 +187,11 @@ struct ObfuscationPassManager : public ModulePass {
     this->Options = Options;
     unsigned   pointerSize = M.getDataLayout().getTypeAllocSize(
         PointerType::getUnqual(M.getContext()));
+
+    // Run first: tagging must happen before any structural transform so the
+    // +vmp symbol/manifest bookkeeping reflects the original function, and
+    // so NoInline is in place before other passes consider inlining it.
+    add(llvm::createVMPTaggerPass(Options.get()));
 
     add(llvm::createConstantIntEncryptionPass(Options.get()));
 

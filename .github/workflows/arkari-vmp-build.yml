@@ -1,0 +1,85 @@
+name: Arkari + VMPacker build
+
+# Manual trigger only -- a full clang/lld build is expensive, so this
+# doesn't run on every push. Trigger it from the Actions tab, or:
+#   gh workflow run arkari-vmp-build.yml
+on:
+  workflow_dispatch:
+    inputs:
+      llvm_targets:
+        description: "LLVM_TARGETS_TO_BUILD"
+        default: "AArch64"
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      WORKDIR: ${{ github.workspace }}-build
+      ARKARI_DIR: ${{ github.workspace }}
+      LLVM_TARGETS: ${{ inputs.llvm_targets }}
+      BUILD_TYPE: Release
+    steps:
+      - uses: actions/checkout@v4
+
+      # GitHub's ubuntu-latest runners ship with a lot of preinstalled SDKs
+      # (dotnet, android, ghc, swap of docker images) that eat most of the
+      # advertised disk before we even start. A full LLVM+clang+lld build
+      # needs the room back.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -a -f || true
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build clang lld golang-go \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: arkari-ccache-${{ runner.os }}-${{ env.LLVM_TARGETS }}-${{ github.sha }}
+          restore-keys: |
+            arkari-ccache-${{ runner.os }}-${{ env.LLVM_TARGETS }}-
+
+      - name: Install ccache
+        run: sudo apt-get install -y ccache
+
+      - name: Build Arkari clang/lld + VMPacker
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          source scripts/common.sh
+
+          # Already checked out by actions/checkout -- don't clone it again.
+          clone_or_update "$VMPACKER_REPO_URL" master "$VMPACKER_DIR"
+
+          EXTRA_CMAKE_ARGS=(
+            "-DLLVM_CCACHE_BUILD=ON"
+          )
+          configure_arkari
+          build_arkari
+          install_arkari
+          install_vmp_headers_and_wrapper
+          build_vmpacker_stub aarch64-linux-gnu-gcc aarch64-linux-gnu-objcopy || true
+          build_vmpacker_cli
+          print_summary
+
+      - name: Package artifacts
+        run: |
+          tar -czf arkari-vmp-toolchain.tar.gz -C "$INSTALL_PREFIX" .
+        env:
+          INSTALL_PREFIX: ${{ github.workspace }}-build/install
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arkari-vmp-toolchain
+          path: arkari-vmp-toolchain.tar.gz
+          retention-days: 14

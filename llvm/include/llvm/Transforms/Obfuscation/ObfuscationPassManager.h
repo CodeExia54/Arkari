@@ -9,6 +9,7 @@
 #include "llvm/Transforms/Obfuscation/ConstantIntEncryption.h"
 #include "llvm/Transforms/Obfuscation/ConstantFPEncryption.h"
 #include "llvm/Transforms/Obfuscation/MicrosoftRTTIEraser.h"
+#include "llvm/Transforms/Obfuscation/VMPTagger.h"
 #include "llvm/Passes/PassBuilder.h"
 
 // Namespace
