@@ -1,0 +1,271 @@
+# Build the Arkari (goron-based LLVM obfuscator) clang for a SELECTED branch and upload it.
+#
+# Arkari is a FULL LLVM monorepo: all obfuscation passes are compiled INTO clang, so the build
+# needs no flag/NDK choices. You enable obfuscation later, at COMPILE time, with -mllvm flags
+# (e.g. -mllvm -irobf -mllvm -irobf-cse ...).
+#
+# TARGET selects what kind of clang binary you get:
+#   * linux-x86_64  -> runs on Ubuntu/PC, emits arm64 (drop into an NDK). ORIGINAL behavior.
+#   * termux-arm64  -> runs ON an arm64 Android phone under Termux, emits arm64. Cross-compiled
+#                      on the same Ubuntu runner against the Android NDK (Bionic, static libc++).
+#
+# Match the LLVM major to your NDK when installing into an NDK:
+#   llvm-18.x -> NDK r27c (clang 18) ,  llvm-19.x -> r28c (clang 19) ,  llvm-21.x -> r29 (clang 21).
+name: build-arkari-select
+
+on:
+  workflow_dispatch:
+    inputs:
+      obf_branch:
+        description: "Arkari branch (LLVM version) to build"
+        type: choice
+        default: llvm-21.x
+        options:
+          - llvm-23.x
+          - llvm-22.x
+          - llvm-21.x
+          - llvm-20.x
+          - llvm-19.x
+          - llvm-18.x
+          - llvm-17.x
+          - llvm-16.x
+          - llvm-15.x
+          - llvm-14.x
+      target:
+        description: "Output platform: where the produced clang RUNS"
+        type: choice
+        default: linux-x86_64
+        options:
+          - linux-x86_64
+          - termux-arm64
+      runner:
+        description: "Build machine (always ubuntu; termux-arm64 is cross-compiled here)"
+        type: choice
+        default: ubuntu-latest
+        options:
+          - ubuntu-latest
+          - ubuntu-22.04
+          - self-hosted
+      custom_ref:
+        description: "Override: exact git ref to check out instead of obf_branch (e.g. a feature branch you're testing before it's merged into the matching llvm-NN.x branch)"
+        type: string
+        default: ""
+
+env:
+  NDK_VERSION: r27c
+  ANDROID_API: "24"
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 350
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build ccache lld clang python3 git binutils curl unzip xz-utils
+
+      - name: Checkout selected Arkari branch (shallow)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.custom_ref != '' && inputs.custom_ref || inputs.obf_branch }}
+          submodules: false
+          fetch-depth: 1
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-arkari-${{ inputs.obf_branch }}-${{ inputs.target }}-${{ github.sha }}
+          restore-keys: |
+            ccache-arkari-${{ inputs.obf_branch }}-${{ inputs.target }}-
+
+      # ---------------------------------------------------------------------------
+      # PATH A: native Linux x86_64 clang  (original, unchanged)
+      # ---------------------------------------------------------------------------
+      - name: Configure clang build (linux-x86_64)
+        if: ${{ inputs.target == 'linux-x86_64' }}
+        run: |
+          set -euxo pipefail
+          cmake -G Ninja -S llvm -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_TARGETS_TO_BUILD="AArch64" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_OPTIMIZED_TABLEGEN=ON \
+            -DLLVM_USE_LINKER=lld \
+            -DLLVM_CCACHE_BUILD=ON \
+            -DLLVM_PARALLEL_LINK_JOBS=2 \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DCLANG_ENABLE_ARCMT=OFF \
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF
+
+      # ---------------------------------------------------------------------------
+      # PATH B: cross-compile an arm64 clang that runs on Termux
+      # ---------------------------------------------------------------------------
+      - name: Download Android NDK (for termux-arm64 cross build)
+        if: ${{ inputs.target == 'termux-arm64' }}
+        run: |
+          set -euxo pipefail
+          curl -fsSL -o ndk.zip "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+          unzip -q ndk.zip
+          echo "ANDROID_NDK=$PWD/android-ndk-${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Build native tablegen tools (host x86_64, for cross build)
+        if: ${{ inputs.target == 'termux-arm64' }}
+        run: |
+          set -euxo pipefail
+          # A cross build cannot run arm64 tablegen on the x86_64 runner, so build the
+          # generators natively first and hand them to the cross configure.
+          cmake -G Ninja -S llvm -B build-native \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_TARGETS_TO_BUILD="AArch64" \
+            -DLLVM_USE_LINKER=lld \
+            -DLLVM_CCACHE_BUILD=ON
+          ninja -C build-native llvm-tblgen clang-tblgen llvm-min-tblgen
+
+      - name: Configure clang build (termux-arm64 cross)
+        if: ${{ inputs.target == 'termux-arm64' }}
+        run: |
+          set -euxo pipefail
+          cmake -G Ninja -S llvm -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-${ANDROID_API} \
+            -DANDROID_STL=c++_static \
+            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_TARGETS_TO_BUILD="AArch64" \
+            -DLLVM_HOST_TRIPLE=aarch64-linux-android${ANDROID_API} \
+            -DLLVM_DEFAULT_TARGET_TRIPLE=aarch64-linux-android${ANDROID_API} \
+            -DLLVM_TABLEGEN="$PWD/build-native/bin/llvm-tblgen" \
+            -DCLANG_TABLEGEN="$PWD/build-native/bin/clang-tblgen" \
+            -DLLVM_NATIVE_TOOL_DIR="$PWD/build-native/bin" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DCLANG_ENABLE_ARCMT=OFF \
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+            -DLLVM_PARALLEL_LINK_JOBS=1 \
+            -DLLVM_CCACHE_BUILD=ON
+
+      # ---------------------------------------------------------------------------
+      # Build (both paths)
+      # ---------------------------------------------------------------------------
+      - name: Build clang (with Arkari obfuscation compiled in)
+        run: |
+          set -euxo pipefail
+          ninja -C build clang
+          if [ "${{ inputs.target }}" = "linux-x86_64" ]; then
+            ./build/bin/clang --version
+          else
+            echo "Cross-built arm64 clang (cannot run here). File type:"
+            file build/bin/clang
+          fi
+
+      # ---------------------------------------------------------------------------
+      # Package
+      # ---------------------------------------------------------------------------
+      - name: Package obfuscating clang toolchain
+        if: always()
+        run: |
+          set -uxo pipefail
+          rm -rf dist && mkdir -p dist/bin
+          if [ ! -f build/bin/clang ]; then echo "::warning::clang was not built."; exit 0; fi
+          cp build/bin/clang  dist/bin/clang
+          cp build/bin/clang  dist/bin/clang++
+
+          if [ "${{ inputs.target }}" = "termux-arm64" ]; then
+            # Strip the arm64 binary with the NDK's cross-capable llvm-strip.
+            STRIP="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+            "$STRIP" dist/bin/clang dist/bin/clang++ 2>/dev/null || true
+            cat > dist/install-in-termux.sh <<'SH'
+          #!/data/data/com.termux/files/usr/bin/bash
+          # Install the Arkari obfuscating clang inside Termux.
+          set -euo pipefail
+          here="$(cd "$(dirname "$0")" && pwd)"
+          install -m0755 "$here/bin/clang"   "$PREFIX/bin/arkari-clang"
+          install -m0755 "$here/bin/clang++" "$PREFIX/bin/arkari-clang++"
+          echo "Installed as arkari-clang / arkari-clang++ in \$PREFIX/bin."
+          echo "It defaults to target aarch64-linux-android. Enable obfuscation with -mllvm -irobf ..."
+          arkari-clang --version
+          SH
+            chmod +x dist/install-in-termux.sh
+            cat > dist/README.txt <<'TXT'
+          Arkari obfuscating clang  (HOST binary: arm64 Android / Termux; runs ON the phone).
+          ==================================================================================
+          Built against the Android NDK (Bionic, static libc++), min API 24 (Android 7+).
+
+          Install in Termux:
+            pkg install libc++            # runtime, just in case
+            ./install-in-termux.sh        # -> arkari-clang / arkari-clang++
+
+          Default target is aarch64-linux-android, so plain `arkari-clang foo.c -O2` already
+          builds arm64. Enable obfuscation at COMPILE time (needs -O1+):
+            -mllvm -irobf                 enable (required)
+            -mllvm -irobf-cse             C-string encryption
+            -mllvm -irobf-fla             control-flow flattening   (llvm-20.x uses -irobf-cff)
+            -mllvm -irobf-indbr           indirect branches
+            -mllvm -irobf-icall           indirect calls
+            -mllvm -irobf-indgv           indirect global refs
+            -mllvm -irobf-cie             integer-constant encryption
+            -mllvm -irobf-cfe             FP-constant encryption
+          Per-function control: [[clang::annotate("+fla +cse")]].
+          TXT
+          else
+            strip dist/bin/clang dist/bin/clang++ 2>/dev/null || true
+            cat > dist/install-into-ndk.sh <<'SH'
+          #!/usr/bin/env bash
+          # Drop the Arkari obfuscating clang into an NDK whose clang major matches this build.
+          # Usage: ./install-into-ndk.sh /path/to/android-ndk-rXX
+          set -euo pipefail
+          NDK="${1:?pass the NDK path, e.g. /home/you/android-ndk-r29}"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          [ -d "$BIN" ] || { echo "Not an NDK toolchain bin dir: $BIN"; exit 1; }
+          here="$(cd "$(dirname "$0")" && pwd)"
+          for f in clang clang++; do
+            [ -e "$BIN/$f.orig" ] || cp -a "$BIN/$f" "$BIN/$f.orig"
+            install -m0755 "$here/bin/$f" "$BIN/$f"
+          done
+          echo "Installed obfuscating clang into $BIN (originals saved as clang.orig / clang++.orig)."
+          echo "Enable obfuscation with -mllvm flags and build at -O1+ (NOT APP_OPTIM=debug)."
+          SH
+            chmod +x dist/install-into-ndk.sh
+            cat > dist/README.txt <<'TXT'
+          Arkari obfuscating clang  (HOST binary: x86_64 Linux; runs on Ubuntu, emits arm64).
+          ================================================================================
+          Install into a version-matched NDK (transparent for ndk-build / CMake / gradle):
+            ./install-into-ndk.sh /path/to/android-ndk-rXX      (restore: copy clang.orig back)
+
+          Enable obfuscation at COMPILE time (e.g. ndk-build: LOCAL_CPPFLAGS += ...):
+            -mllvm -irobf                 enable (required)
+            -mllvm -irobf-cse             C-string encryption
+            -mllvm -irobf-fla             control-flow flattening   (llvm-20.x uses -irobf-cff)
+            -mllvm -irobf-indbr           indirect branches
+            -mllvm -irobf-icall           indirect calls
+            -mllvm -irobf-indgv           indirect global refs
+            -mllvm -irobf-cie             integer-constant encryption
+            -mllvm -irobf-cfe            FP-constant encryption
+          Passes only run at -O1 or higher. Per-function control: [[clang::annotate("+fla +cse")]].
+          TXT
+          fi
+          du -h dist/bin/* || true
+
+      - name: Upload obfuscating clang toolchain
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arkari-clang-${{ inputs.target }}-${{ inputs.obf_branch }}
+          path: dist/**
+          if-no-files-found: warn
